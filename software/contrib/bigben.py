@@ -193,6 +193,23 @@ class BigBen(EuroPiScript):
 
     def burst_init(self):
         self.tasks["burst"].reset()
+        in_threshold = k2.percent() * 100
+        print(ain.read_voltage())
+        print(ain.range())
+        print(f"should I burst? {in_threshold}")
+        times = {1: 2, 2: 3, 3: 4, 4: 8, 5: 16}
+        self.tasks["burst"].create(self.toggle_cv(cvs[0]))
+
+        for i, cv in enumerate(cvs[1:]):
+            cv_threshold = 15 + 10 * (i + 1)
+            if in_threshold > cv_threshold:
+                print(f"burst {i} (in_threshold = {in_threshold}, cv_threshold = {cv_threshold})!")
+                self.tasks["burst"].create(self.burst_cv(cv, times[i + 1]))
+            else:
+                print(
+                    f"no burst {i} (in_threshold = {in_threshold}, cv_threshold = {cv_threshold})!"
+                )
+                break
         self.tasks["burst"].run()
 
     def burst_exit(self):
@@ -251,25 +268,6 @@ class BigBen(EuroPiScript):
         for _ in range(times):
             self.toggle_cv(cv)
             sleep_ms(int(duration))
-
-    def burst(self):
-        in_threshold = k2.percent() * 100
-        print(ain.read_voltage())
-        print(ain.range())
-        print(f"should I burst? {in_threshold}")
-        times = {1: 2, 2: 3, 3: 4, 4: 8, 5: 16}
-        self.tasks["burst"].create(self.toggle_cv(cvs[0]))
-
-        for i, cv in enumerate(cvs[1:]):
-            cv_threshold = 15 + 10 * (i + 1)
-            if in_threshold > cv_threshold:
-                print(f"burst {i} (in_threshold = {in_threshold}, cv_threshold = {cv_threshold})!")
-                self.tasks["burst"].create(self.burst_cv(cv, times[i + 1]))
-            else:
-                print(
-                    f"no burst {i} (in_threshold = {in_threshold}, cv_threshold = {cv_threshold})!"
-                )
-                break
 
     def measure_tempo(self):
         self.tempo_samples.append(ticks_ms())
