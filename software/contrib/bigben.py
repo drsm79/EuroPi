@@ -22,54 +22,8 @@ try:
 except ImportError:
     import asyncio
 
-MODES = ["DivMult", "Burst", "Dilla", "RandomSync"]
+
 TRIGGER_LENGTH = 20
-
-
-class TaskManager:
-    def __init__(self, size=6) -> None:
-        self.tasks = []
-        self.size = size
-
-    async def _wrap(self, fn):
-        await fn
-
-    def create(self, task_fn):
-        task = asyncio.create_task(self._wrap(task_fn))
-        if len(self.tasks) >= self.size:
-            print(f"Too many tasks: {len(self.tasks)} ignoring {task}")
-            self.status()
-        else:
-            self.tasks.append(task)
-            print(self.status())
-
-    def status(self):
-        print(f"Have {len(self.tasks)} tasks")
-        for t in self.tasks:
-            print(t, t.state, t.done(), dir(t))
-            if t.done():
-                self.discard(t)
-
-    def discard(self, task):
-        print(f"discarding {task} {self.tasks.index(task)}")
-        self.tasks.remove(task)
-
-    async def run_internal(self):
-        run = len(self.tasks) > 0
-        while run:
-            print("run internal")
-            for t in self.tasks:
-                await t
-            self.status()
-            run = len(self.tasks) > 0
-
-    def run(self):
-        asyncio.run(self.run_internal())
-
-    def reset(self):
-        for t in self.tasks:
-            t.cancel()
-        self.tasks = []
 
 
 class InternalClocks:
@@ -88,8 +42,10 @@ class InternalClocks:
             if len(new_times):
                 clock.init(period=int(new_times.pop(0)), callback=cb)
 
-    def reset_one(self, idx):
+    def reset_one(self, idx, period=None, cb=None):
         self.timers[idx].deinit()
+        if period and cb:
+            self.timers[idx].init(period=period, callback=cb)
 
 
 class ModeHandler:
@@ -123,10 +79,10 @@ class ModeHandler:
             self.register_mode(mode)
         self.mode_exits[mode] = function
 
-    def __call__(self) -> Any:
-        print(f"Called for {self.current_mode}")
+    def __call__(self, idx):
+        print(f"Called for {self.current_mode} for index {idx}")
         if self.modes[self.current_mode]:
-            return self.modes[self.current_mode]()
+            return self.modes[self.current_mode](idx)
 
     def __str__(self) -> str:
         return f"Current mode is {self.current_mode}. {len(self.modes)} modes available."
@@ -155,11 +111,41 @@ class ModeHandler:
         self.run_if(self.mode_inits)
 
 
+class ClockStateHelper:
+    def __init__(self, times=[], indexes=[], max=16, func=None) -> None:
+        self.times = times
+        self.indexes = indexes
+        self.count = 0
+        self.max = 16
+        if func:
+            self.func = func
+
+    def __call__(self, timer):
+        self.count += 1
+        if self.count >= self.max:
+            self.count = 0
+        self.func(timer, self)
+
+
+internal_led = Pin(25, Pin.OUT)
+
+
+def flash_led(func):
+    def wrapper(*args, **kwargs):
+        internal_led.on()
+        func(*args, **kwargs)
+        internal_led.off()
+
+    return wrapper
+
+
 class BigBen(EuroPiScript):
-    def toggle_cv(self, cv):
-        cv.on()
+    def toggle_cv(self, cv_idx):
+        print(f"Toggle cv {cv_idx} on @ {ticks_ms()}")
+        cvs[cv_idx].on()
         asyncio.sleep_ms(TRIGGER_LENGTH)
-        cv.off()
+        print(f"Toggle cv {cv_idx} off @ {ticks_ms()}")
+        cvs[cv_idx].off()
 
     def __init__(self):
         super().__init__()
@@ -169,105 +155,121 @@ class BigBen(EuroPiScript):
         self.tasks = {}
         self.internal_clocks = InternalClocks()
         self.modes = ModeHandler()
-        self.internal_led = Pin(25, Pin.OUT)
 
         self.setup_handlers()
-
-    def setup_handlers(self):
-        din.handler(self.measure_tempo)
-        b1.handler(self.measure_tempo)
-        b2.handler(self.mode_button)
-
-        self.tasks["burst"] = TaskManager()
-
-        self.modes.register_mode_init("divmult", self.init_divmult)
-        self.modes.register_mode_init("dilla", self.init_dilla)
-
-        self.modes.register_mode_exit("divmult", self.exit_divmult)
-        self.modes.register_mode_exit("dilla", self.exit_dilla)
-
-        self.modes.register_mode("random", self.random)
-        self.modes.register_mode("burst", self.burst)
-        self.modes.register_mode_init("burst", self.burst_init)
-        self.modes.register_mode_exit("burst", self.burst_exit)
-
-    def burst_init(self):
-        self.tasks["burst"].reset()
-        in_threshold = k2.percent() * 100
-        print(ain.read_voltage())
-        print(ain.range())
-        print(f"should I burst? {in_threshold}")
-        times = {1: 2, 2: 3, 3: 4, 4: 8, 5: 16}
-        self.tasks["burst"].create(self.toggle_cv(cvs[0]))
-
-        for i, cv in enumerate(cvs[1:]):
-            cv_threshold = 15 + 10 * (i + 1)
-            if in_threshold > cv_threshold:
-                print(f"burst {i} (in_threshold = {in_threshold}, cv_threshold = {cv_threshold})!")
-                self.tasks["burst"].create(self.burst_cv(cv, times[i + 1]))
-            else:
-                print(
-                    f"no burst {i} (in_threshold = {in_threshold}, cv_threshold = {cv_threshold})!"
-                )
-                break
-        self.tasks["burst"].run()
-
-    def burst_exit(self):
-        self.tasks["burst"].reset()
 
     def mode_button(self):
         print(f"Mode button! {self.modes}")
         self.modes.next()
 
+    def get_period(self):
+        return int(self.quarter * (4 / self.clock_division()))
+
+    @flash_led
+    def setup_handlers(self):
+        din.handler(self.measure_tempo)
+        b1.handler(self.measure_tempo)
+        b2.handler(self.mode_button)
+
+        # divmult is in how the clocks are set up, the action is just to toggle
+        self.modes.register_mode("divmult", self.toggle_cv)
+        self.modes.register_mode_init("divmult", self.init_divmult)
+        self.modes.register_mode_exit("divmult", self.exit_divmult)
+
+        self.modes.register_mode("dilla", self.toggle_cv)
+        self.modes.register_mode_init("dilla", self.init_generic)
+        self.modes.register_mode_exit("dilla", self.exit_dilla)
+
+        self.modes.register_mode("random", self.random)
+        self.modes.register_mode_init("random", self.init_generic)
+
+        self.modes.register_mode("burst", self.burst)
+        self.modes.register_mode_init("burst", self.burst_init)
+        self.modes.register_mode_exit("burst", self.burst_exit)
+
+    def burst_init(self):
+        self.internal_clocks.reset()
+        if not self.quarter > 0:
+            print("No tempo")
+            return
+
+        period = self.get_period()
+
+        evens = ClockStateHelper(times=[2, 4, 8, 16], indexes=[5, 3, 1, 0], func=self.burst)
+        three = ClockStateHelper(times=[3], indexes=[2], func=self.burst)
+        five = ClockStateHelper(times=[5], indexes=[4], func=self.burst)
+
+        self.internal_clocks.reset(new_times=[int(period / 16)], cb=evens)
+        self.internal_clocks.reset_one(2, period=int(period / 3), cb=three)
+        self.internal_clocks.reset_one(4, period=int(period / 5), cb=five)
+
+    @flash_led
+    def burst(self, _, helper):
+        in_threshold = k2.percent() * 100
+        for c, i in enumerate(helper.indexes):
+            cv_threshold = 15 + 10 * (i + 1)
+            if in_threshold > cv_threshold and not helper.count % helper.times[c]:
+                print(f"Burst toggling {i} for count {helper.count}, {c}!")
+                self.toggle_cv(i)
+        sleep_ms(TRIGGER_LENGTH)
+        for i in helper.indexes:
+            cvs[i].off()
+
+    def burst_exit(self):
+        self.internal_clocks.reset()
+
     def init_divmult(self):
         if self.quarter > 0:
-            period = int(self.quarter * (4 / self.clock_division()))
-            times = [period, period * 2, period * 4, period / 2, period / 4, period / 8]
+            period = int(self.get_period() / 8)
+            evens = ClockStateHelper(
+                times=[32, 16, 8, 4, 2, 1], max=64, indexes=[0, 1, 2, 3, 4, 5], func=self.divmult
+            )
+            self.internal_clocks.reset(new_times=[period], cb=evens)
+        else:
+            print("No tempo")
+            self.internal_clocks.reset()
+
+    @flash_led
+    def divmult(self, _, helper):
+        for c, i in enumerate(helper.indexes):
+            if not helper.count % helper.times[c]:
+                self.toggle_cv(i)
+        sleep_ms(TRIGGER_LENGTH)
+        for i in helper.indexes:
+            cvs[i].off()
+
+    def exit_divmult(self):
+        print("Exit divmult")
+        self.internal_clocks.reset()
+
+    def init_generic(self):
+        self.internal_clocks.reset()
+        if self.quarter > 0:
+            # init a single clock at the tempo
+            times = [self.get_period()]
             self.internal_clocks.reset(new_times=times, cb=self.triggered)
         else:
             print("No tempo")
 
-    def exit_divmult(self):
-        print("Exit divmult")
-        self.reset_internal_clocks()
-
-    def dilla(self):
+    def dilla(self, idx):
         print("wobble")
-
-    def init_dilla(self):
-        pass
 
     def exit_dilla(self):
         print("Exit dilla")
-        self.reset_internal_clocks()
+        self.internal_clocks.reset()
 
-    def get_times(self):
+    def random(self, idx):
         """
-        Calculate the appropriate clock timings, with clock division read from knob 1 applied to the BPM.
-
-        In DivMult mode, clocks are set to BPM, BPM * 2, BPM * 4, BPM * 8, BPM/2 & BPM/4
+        Random gates over all six outputs, roughly aligned to the clock
         """
-        period = int(self.quarter * (4 / self.clock_division()))
-        if self.modes.current_mode == "divmult":
-            return [period, period * 2, period * 4, period / 2, period / 4, period / 8]
-        else:
-            return [period] * 6
-
-    def reset_internal_clocks(self):
-        """
-        Stop the internal clocks and, if a tempo is set, start new ones.
-        """
-        if self.quarter > 0:
-            self.internal_clocks.reset(new_times=self.get_times(), cb=self.triggered)
-        else:
-            self.internal_clocks.reset()
-
-    def burst_cv(self, cv, times):
-        # TODO: make async/non-blocking
-        duration = self.quarter / times
-        for _ in range(times):
-            self.toggle_cv(cv)
-            sleep_ms(int(duration))
+        seed = str(random()).replace("0.", "")
+        for i, cv in enumerate(cvs):
+            comp = int(seed[i]) % (i + 1)
+            if not comp or comp == i:
+                print(f"cv {i} on for seed {seed}:{comp}")
+                cv.on()
+        sleep_ms(TRIGGER_LENGTH)
+        turn_off_all_cvs()
 
     def measure_tempo(self):
         self.tempo_samples.append(ticks_ms())
@@ -278,25 +280,11 @@ class BigBen(EuroPiScript):
             self.modes.reinit()
             self.tempo_samples = []
 
-    def random(self):
-        """
-        Random gates over all six outputs, roughly aligned to the clock
-        """
-        seed = random()
-        for i, cv in enumerate(cvs):
-            print(seed * (10 * i + 1))
-            if i == int(seed * (10 * i + 1)):
-                cv.on()
-        sleep_ms(20)
-        turn_off_all_cvs()
-
+    @flash_led
     def triggered(self, timer):
         i = self.internal_clocks.timers.index(timer)
-        print("triggered", timer, i)
-        self.modes()
-        self.internal_led.on()
-        sleep_ms(TRIGGER_LENGTH)
-        self.internal_led.off()
+        print(f"Timer {i} triggered")
+        self.modes(i)
 
     def clock_division(self):
         return k1.choice([1, 2, 3, 4, 5, 6, 7, 8, 16, 32])
@@ -304,7 +292,7 @@ class BigBen(EuroPiScript):
     def display_name(self):
         title = f"BigBen : {self.modes.current_mode}"
         if self.quarter > 0:
-            return f"{title}\n{self.tempo_bpm():.2f} - {self.clock_division()}"
+            return f"{title}\n{4 * self.tempo_bpm():.2f} - {self.clock_division()}"
         else:
             return f"{title}\nNo BPM - {self.clock_division()}"
 
@@ -315,7 +303,7 @@ class BigBen(EuroPiScript):
         old = 1
         while True:
             if self.clock_division() != old:
-                self.reset_internal_clocks()
+                self.modes.reinit()
                 old = self.clock_division()
 
             oled.centre_text(self.display_name())
